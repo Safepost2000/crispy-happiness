@@ -3,3 +3,6 @@ google-generativeai
 pillow
 python-dotenv
 requests
+SpeechRecognition
+gTTS 
+ffmpeg-python
