@@ -1,0 +1,11 @@
+# Exported from Render on 2025-04-13T19:28:26Z
+services:
+- type: web
+  name: crispy-happiness
+  runtime: python
+  repo: https://github.com/Safepost2000/crispy-happiness
+  plan: free
+  region: singapore
+  buildCommand: pip install -r requirements.txt
+  startCommand: python3 main.py
+version: "1"
