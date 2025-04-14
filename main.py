@@ -1,568 +1,320 @@
-import os
-import asyncio
 import logging
-import tempfile
-from io import BytesIO
-import base64
-import uuid
-import time
+import os
+import io
 import requests
 from dotenv import load_dotenv
-from telegram import Update, Bot, InputFile
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    ConversationHandler,
-    filters
-)
-import google.generativeai as genai
 from PIL import Image
-import speech_recognition as sr
-from gtts import gTTS
+import google.generativeai as genai
+from telegram import Update, InputMediaPhoto, InputFile, constants
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.error import TelegramError
+
+# --- Configuration ---
+load_dotenv()  # Load environment variables from .env file for local development
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+
+# --- Gemini Model Configuration ---
+# Model for understanding text and images (multimodal input)
+# 'gemini-1.5-flash' is a good choice for this.
+VISION_MODEL_NAME = "gemini-1.5-flash"
+
+# Model for generating images.
+# !!! IMPORTANT !!! Replace this with the actual, available model name from Google AI
+# that supports API-based image generation. The user-provided name might be experimental.
+# Check Google AI Studio / Vertex AI documentation.
+# If using Vertex AI Imagen, the API call structure will be different.
+GENERATION_MODEL_NAME = os.getenv("GENERATION_MODEL_NAME", "models/gemini-1.5-flash-latest") # Placeholder - Verify correct model!
+# Example placeholder: GENERATION_MODEL_NAME = "models/imagen-2..." (if using Vertex)
+
+# Configure Google Generative AI
+if GOOGLE_API_KEY:
+    genai.configure(api_key=GOOGLE_API_KEY)
+else:
+    logging.warning("GOOGLE_API_KEY not found in environment variables.")
+    # Exit or handle gracefully if API key is missing
+    # exit("API key missing.") # Uncomment to exit if API key is crucial
+
+# Initialize models (handle potential errors if key/model is invalid)
+try:
+    vision_model = genai.GenerativeModel(VISION_MODEL_NAME)
+    # Only initialize generation model if the name seems plausible or configured
+    if GENERATION_MODEL_NAME and GOOGLE_API_KEY:
+         generation_model = genai.GenerativeModel(GENERATION_MODEL_NAME)
+         logging.info(f"Using generation model: {GENERATION_MODEL_NAME}")
+    else:
+         generation_model = None
+         logging.warning("Image Generation model not configured or API key missing.")
+
+except Exception as e:
+    logging.error(f"Failed to initialize Gemini models: {e}")
+    # Consider exiting or disabling features if models fail to load
+    vision_model = None
+    generation_model = None
+
 
 # Enable logging
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
+# Set higher logging level for httpx to avoid excessive noise
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-# Load environment variables
-load_dotenv()
 
-# Get tokens from environment variables
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
-# Configure the Gemini API
-genai.configure(api_key=GEMINI_API_KEY)
-
-# Set up the models - using the specified model for all operations
-MODEL_NAME = "gemini-2.0-flash-exp-image-generation"  # The newer model you specified
-
-# Conversation states
-CHATTING = 0
-
-# Store user data
-user_data = {}
-
-# System instructions for the bot
-DEFAULT_SYSTEM_INSTRUCTION = (
-    "You are an advanced AI assistant powered by Google's Gemini. "
-    "You are helpful, creative, and friendly. "
-    "When appropriate, generate image descriptions enclosed in triple square brackets, like: "
-    "[[[Generate an image of a sunset over mountains]]] "
-    "For voice responses, indicate when something should be spoken in triple angle brackets, like: "
-    "<<<This is the text that should be converted to speech>>> "
-    "Respond to user inputs in a helpful and informative manner."
-)
-
-def get_user_chat(user_id):
-    """Get or create a chat for a user."""
-    if user_id not in user_data:
-        user_data[user_id] = {
-            "chat": genai.GenerativeModel(MODEL_NAME).start_chat(
-                history=[],
-                system_instruction=DEFAULT_SYSTEM_INSTRUCTION
-            ),
-            "system_instruction": DEFAULT_SYSTEM_INSTRUCTION,
-            "settings": {
-                "temperature": 0.7,
-                "top_p": 0.95,
-                "top_k": 64,
-                "max_output_tokens": 8192,
-            }
-        }
-    return user_data[user_id]["chat"]
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Send a message when the command /start is issued."""
-    user = update.effective_user
-    user_id = user.id
-    
-    # Initialize user data if needed
-    if user_id not in user_data:
-        get_user_chat(user_id)
-        
-    welcome_message = (
-        f"👋 Hello {user.mention_html()}! I'm an advanced Gemini multimodal assistant.\n\n"
-        f"I can understand and generate:\n"
-        f"🔹 Text messages\n"
-        f"🔹 Images\n"
-        f"🔹 Voice messages\n\n"
-        f"Try sending me any of these formats and I'll respond accordingly!\n"
-        f"Type /help to see all available commands."
-    )
-    
-    await update.message.reply_html(welcome_message)
-    return CHATTING
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Send a message when the command /help is issued."""
-    help_text = (
-        "🤖 *Gemini Multimodal Chatbot* 🤖\n\n"
-        "*Commands:*\n"
-        "/start - Start or restart the bot\n"
-        "/help - Show this help message\n"
-        "/reset - Reset your conversation history\n"
-        "/settings - View current model settings\n"
-        "/temperature - Set temperature (0.0-1.0)\n\n"
-        "*Multimodal Capabilities:*\n"
-        "• Send text messages for normal conversation\n"
-        "• Send images for analysis or to guide responses\n"
-        "• Send voice messages for speech-to-text conversion\n"
-        "• Receive text, image, and voice responses\n\n"
-        "*Tips:*\n"
-        "• For image generation, the bot recognizes special patterns in responses\n"
-        "• Voice responses are generated from text responses when appropriate\n"
-        "• Use /reset if the conversation gets off track\n\n"
-        f"Powered by Google's {MODEL_NAME} model"
-    )
-    await update.message.reply_markdown(help_text)
-    return CHATTING
-
-async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Reset the conversation history."""
-    user_id = update.effective_user.id
-    
-    # Get the current system instruction
-    system_instruction = DEFAULT_SYSTEM_INSTRUCTION
-    if user_id in user_data:
-        system_instruction = user_data[user_id].get("system_instruction", DEFAULT_SYSTEM_INSTRUCTION)
-    
-    # Create a new chat with the same system instruction
-    user_data[user_id] = {
-        "chat": genai.GenerativeModel(MODEL_NAME).start_chat(
-            history=[],
-            system_instruction=system_instruction
-        ),
-        "system_instruction": system_instruction,
-        "settings": user_data.get(user_id, {}).get("settings", {
-            "temperature": 0.7,
-            "top_p": 0.95,
-            "top_k": 64,
-            "max_output_tokens": 8192,
-        })
-    }
-    
-    await update.message.reply_text("✅ Conversation history has been reset. Let's start fresh!")
-    return CHATTING
-
-async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Show current model settings."""
-    user_id = update.effective_user.id
-    
-    if user_id not in user_data:
-        get_user_chat(user_id)
-    
-    settings = user_data[user_id]["settings"]
-    
-    settings_text = (
-        "⚙️ *Current Model Settings* ⚙️\n\n"
-        f"• Model: `{MODEL_NAME}`\n"
-        f"• Temperature: `{settings.get('temperature', 0.7)}`\n"
-        f"• Top-P: `{settings.get('top_p', 0.95)}`\n"
-        f"• Top-K: `{settings.get('top_k', 64)}`\n"
-        f"• Max Output Tokens: `{settings.get('max_output_tokens', 8192)}`\n\n"
-        "Use /temperature followed by a value between 0.0 and 1.0 to adjust temperature.\n"
-        "Example: `/temperature 0.8`"
-    )
-    
-    await update.message.reply_markdown(settings_text)
-    return CHATTING
-
-async def set_temperature(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Set temperature for the model."""
-    user_id = update.effective_user.id
-    
-    if user_id not in user_data:
-        get_user_chat(user_id)
-    
+# --- Helper Functions ---
+async def download_image(file_id: str, context: ContextTypes.DEFAULT_TYPE) -> bytes | None:
+    """Downloads an image from Telegram into memory."""
+    bot = context.bot
     try:
-        # Extract the temperature value from the command
-        args = context.args
-        if not args:
-            raise ValueError("No temperature value provided")
-        
-        temp = float(args[0])
-        if temp < 0.0 or temp > 1.0:
-            raise ValueError("Temperature must be between 0.0 and 1.0")
-        
-        # Update the temperature setting
-        user_data[user_id]["settings"]["temperature"] = temp
-        
-        await update.message.reply_text(f"✅ Temperature set to {temp}")
-    except ValueError as e:
-        await update.message.reply_text(
-            f"❌ Error: {str(e)}\n"
-            "Please use a value between 0.0 and 1.0.\n"
-            "Example: `/temperature 0.8`"
-        )
-    
-    return CHATTING
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle text messages."""
-    user_id = update.effective_user.id
-    user_message = update.message.text
-    chat = get_user_chat(user_id)
-    settings = user_data[user_id]["settings"]
-    
-    # Send typing action
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-    
-    try:
-        # Create a generation config from user settings
-        generation_config = genai.types.GenerationConfig(
-            temperature=settings.get("temperature", 0.7),
-            top_p=settings.get("top_p", 0.95),
-            top_k=settings.get("top_k", 64),
-            max_output_tokens=settings.get("max_output_tokens", 8192),
-        )
-        
-        # Get response from Gemini
-        response = await asyncio.to_thread(
-            chat.send_message, 
-            user_message,
-            generation_config=generation_config
-        )
-        
-        # Process the response for multimodal outputs
-        await process_and_send_response(update, context, response.text)
-        
+        file = await bot.get_file(file_id)
+        # Download file content into a BytesIO object
+        file_stream = io.BytesIO()
+        await file.download_to_memory(file_stream)
+        file_stream.seek(0)
+        return file_stream.read() # Return the bytes
+    except TelegramError as e:
+        logger.error(f"Telegram error downloading image with file_id {file_id}: {e}")
+        return None
     except Exception as e:
-        logger.error(f"Error while processing text message: {e}")
-        await update.message.reply_text(
-            "Sorry, I encountered an error while processing your message.\n"
-            f"Error details: {str(e)}"
-        )
-    
-    return CHATTING
-
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle photos with or without captions."""
-    user_id = update.effective_user.id
-    chat = get_user_chat(user_id)
-    settings = user_data[user_id]["settings"]
-    
-    # Send typing action
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-    
-    try:
-        # Get the photo file
-        photo_file = await context.bot.get_file(update.message.photo[-1].file_id)
-        photo_bytes = await photo_file.download_as_bytearray()
-        
-        # Get the caption if it exists, otherwise use a default prompt
-        caption = update.message.caption if update.message.caption else "What do you see in this image? Provide a detailed description."
-        
-        # Create a generative model with user settings
-        model = genai.GenerativeModel(
-            MODEL_NAME,
-            generation_config=genai.types.GenerationConfig(
-                temperature=settings.get("temperature", 0.7),
-                top_p=settings.get("top_p", 0.95),
-                top_k=settings.get("top_k", 64),
-                max_output_tokens=settings.get("max_output_tokens", 8192),
-            )
-        )
-        
-        # Create multimodal prompt
-        response = await asyncio.to_thread(
-            model.generate_content,
-            [
-                caption,
-                {"mime_type": "image/jpeg", "data": photo_bytes}
-            ]
-        )
-        
-        # Process the response for multimodal outputs
-        await process_and_send_response(update, context, response.text)
-        
-        # Add the interaction to the conversation history
-        chat.history.append({
-            "role": "user",
-            "parts": [{"text": f"[Image shared with caption: {caption}]"}]
-        })
-        
-        chat.history.append({
-            "role": "model",
-            "parts": [{"text": response.text}]
-        })
-        
-    except Exception as e:
-        logger.error(f"Error while processing photo: {e}")
-        await update.message.reply_text(
-            "Sorry, I encountered an error while processing your image.\n"
-            f"Error details: {str(e)}"
-        )
-    
-    return CHATTING
-
-async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle voice messages by converting speech to text and then processing the text."""
-    user_id = update.effective_user.id
-    chat = get_user_chat(user_id)
-    
-    # Send typing action
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-    
-    try:
-        # Get the voice file
-        voice_file = await context.bot.get_file(update.message.voice.file_id)
-        
-        # Create a temporary file to save the voice message
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.ogg') as temp_voice:
-            voice_path = temp_voice.name
-            await voice_file.download_to_drive(custom_path=voice_path)
-        
-        # Convert to WAV for speech recognition
-        wav_path = voice_path.replace('.ogg', '.wav')
-        os.system(f"ffmpeg -i {voice_path} {wav_path} -y")
-        
-        # Perform speech recognition
-        recognizer = sr.Recognizer()
-        with sr.AudioFile(wav_path) as source:
-            audio_data = recognizer.record(source)
-            text = recognizer.recognize_google(audio_data)
-        
-        # Clean up temporary files
-        os.unlink(voice_path)
-        os.unlink(wav_path)
-        
-        # Inform the user their speech was recognized
-        await update.message.reply_text(f"🎤 I heard: \"{text}\"\n\nProcessing your request...")
-        
-        # Process the transcribed text with Gemini
-        generation_config = genai.types.GenerationConfig(
-            temperature=user_data[user_id]["settings"].get("temperature", 0.7),
-            top_p=user_data[user_id]["settings"].get("top_p", 0.95),
-            top_k=user_data[user_id]["settings"].get("top_k", 64),
-            max_output_tokens=user_data[user_id]["settings"].get("max_output_tokens", 8192),
-        )
-        
-        # Get response from Gemini
-        response = await asyncio.to_thread(
-            chat.send_message, 
-            text,
-            generation_config=generation_config
-        )
-        
-        # Process the response for multimodal outputs
-        await process_and_send_response(update, context, response.text)
-        
-    except sr.UnknownValueError:
-        await update.message.reply_text("Sorry, I couldn't understand the audio. Please try speaking more clearly.")
-    except sr.RequestError:
-        await update.message.reply_text("Sorry, there was an issue with the speech recognition service. Please try again later.")
-    except Exception as e:
-        logger.error(f"Error while processing voice message: {e}")
-        await update.message.reply_text(
-            "Sorry, I encountered an error while processing your voice message.\n"
-            f"Error details: {str(e)}"
-        )
-    
-    return CHATTING
-
-async def process_and_send_response(update, context, response_text):
-    """Process the response text to handle various response types (text, image, voice)."""
-    chat_id = update.effective_chat.id
-    
-    # Check for image generation triggers
-    image_prompts = extract_image_prompts(response_text)
-    response_without_image_prompts = remove_image_prompts(response_text)
-    
-    # Check for voice response triggers
-    voice_text, text_only = extract_voice_text(response_without_image_prompts)
-    
-    # First send the text response
-    if text_only:
-        await context.bot.send_message(chat_id=chat_id, text=text_only)
-    
-    # Then generate and send any images
-    for image_prompt in image_prompts:
-        await context.bot.send_chat_action(chat_id=chat_id, action="upload_photo")
-        try:
-            image_data = await generate_image(image_prompt)
-            if image_data:
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as temp_img:
-                    temp_img.write(image_data)
-                    temp_img_path = temp_img.name
-                
-                # Send the generated image
-                with open(temp_img_path, 'rb') as img:
-                    await context.bot.send_photo(
-                        chat_id=chat_id, 
-                        photo=InputFile(img),
-                        caption=f"Generated image based on: {image_prompt[:100]}..."
-                    )
-                
-                # Clean up
-                os.unlink(temp_img_path)
-            else:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"I tried to generate an image for '{image_prompt}' but couldn't create it successfully."
-                )
-        except Exception as e:
-            logger.error(f"Error generating image: {e}")
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"I couldn't generate the requested image due to an error: {str(e)}"
-            )
-    
-    # Finally, generate and send any voice responses
-    if voice_text:
-        await context.bot.send_chat_action(chat_id=chat_id, action="record_audio")
-        try:
-            voice_data = await generate_voice(voice_text)
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as temp_voice:
-                temp_voice.write(voice_data)
-                temp_voice_path = temp_voice.name
-            
-            # Send the generated voice message
-            with open(temp_voice_path, 'rb') as voice:
-                await context.bot.send_voice(
-                    chat_id=chat_id,
-                    voice=InputFile(voice)
-                )
-            
-            # Clean up
-            os.unlink(temp_voice_path)
-        except Exception as e:
-            logger.error(f"Error generating voice: {e}")
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"I couldn't generate the voice response due to an error: {str(e)}"
-            )
-
-def extract_image_prompts(text):
-    """Extract image generation prompts from text."""
-    import re
-    # Look for prompts enclosed in [[[prompt]]] format
-    image_prompts = re.findall(r'\[\[\[(.*?)\]\]\]', text)
-    return image_prompts
-
-def remove_image_prompts(text):
-    """Remove image prompts from text."""
-    import re
-    return re.sub(r'\[\[\[(.*?)\]\]\]', '', text)
-
-def extract_voice_text(text):
-    """Extract text that should be converted to speech."""
-    import re
-    voice_texts = re.findall(r'<<<(.*?)>>>', text)
-    # Join all voice texts with spaces
-    voice_text = ' '.join(voice_texts) if voice_texts else ""
-    
-    # Remove the voice markers from the text
-    text_only = re.sub(r'<<<(.*?)>>>', '', text)
-    
-    return voice_text, text_only
-
-async def generate_image(prompt):
-    """Generate an image based on a text prompt.
-    
-    This function uses the Gemini image generation capability if available,
-    or falls back to a third-party image generation service.
-    """
-    try:
-        # Placeholder for actual image generation
-        # In a real implementation, this would call the Gemini API or another image generation service
-        
-        # For demonstration, we'll use a placeholder image generation service
-        # This code should be replaced with actual implementation
-        
-        # Simulate image generation with a delay
-        await asyncio.sleep(2)
-        
-        # For testing, return a simple gradient image
-        from PIL import Image, ImageDraw
-        
-        # Create a gradient image as a placeholder
-        img = Image.new('RGB', (512, 512), color='white')
-        draw = ImageDraw.Draw(img)
-        
-        # Draw a simple gradient
-        for y in range(512):
-            for x in range(512):
-                r = int(255 * x / 512)
-                g = int(255 * y / 512)
-                b = int(128)
-                draw.point((x, y), fill=(r, g, b))
-        
-        # Add some text to the image
-        draw.text((20, 20), f"Image from prompt: {prompt[:50]}...", fill=(255, 255, 255))
-        
-        # Convert to bytes
-        img_byte_array = BytesIO()
-        img.save(img_byte_array, format='JPEG')
-        return img_byte_array.getvalue()
-        
-    except Exception as e:
-        logger.error(f"Image generation error: {e}")
+        logger.error(f"Unexpected error downloading image: {e}")
         return None
 
-async def generate_voice(text):
-    """Generate voice audio from text using gTTS."""
-    try:
-        tts = gTTS(text=text, lang='en', slow=False)
-        
-        # Save to a BytesIO object
-        mp3_fp = BytesIO()
-        tts.write_to_fp(mp3_fp)
-        mp3_fp.seek(0)
-        
-        return mp3_fp.read()
-    except Exception as e:
-        logger.error(f"Voice generation error: {e}")
-        raise
+# --- Command Handlers ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Sends a welcome message when the /start command is issued."""
+    user_name = update.effective_user.first_name
+    await update.message.reply_text(
+        f"Hello {user_name}! I'm your Gemini bot.\n\n"
+        "➡️ Send me text, or text with an image, and I'll respond.\n"
+        f"➡️ Use `/generate_image [your prompt]` to create an image (if enabled)."
+    )
 
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle errors."""
-    logger.error(f"Update {update} caused error {context.error}")
-    
-    # Send message to the user if possible
-    if update and update.effective_message:
-        await update.effective_message.reply_text(
-            "Sorry, something went wrong while processing your request.\n"
-            "Please try again later or reset the conversation with /reset."
+async def generate_image_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Generates an image based on the user's prompt using the specified Gemini model."""
+    if not generation_model:
+        await update.message.reply_text("Sorry, the image generation feature is not available or not configured correctly.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Please provide a description for the image after the command.\nUsage: `/generate_image a cat wearing a wizard hat`")
+        return
+
+    prompt = " ".join(context.args)
+    user = update.effective_user
+    logger.info(f"User {user.id} requested image generation with prompt: '{prompt}'")
+    # Let the user know processing has started
+    processing_message = await update.message.reply_text(f"⏳ Generating image for prompt: '{prompt}'...", disable_notification=True)
+
+    try:
+        # --- Image Generation API Call ---
+        # IMPORTANT: This is a potential structure. The actual API call might differ.
+        # You might need specific parameters, prompt formats, or even a different library
+        # (like google-cloud-aiplatform for Vertex AI's Imagen).
+        # Check the documentation for your specific GENERATION_MODEL_NAME.
+
+        # Assuming generate_content can handle image generation prompts:
+        response = await generation_model.generate_content_async(
+             f"Generate an image depicting: {prompt}" # Example prompt structure
+             # Add generation_config parameters if needed (e.g., number of candidates)
         )
 
-def main() -> None:
-    """Start the bot."""
-    # Create the Application
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
+        # --- Process Generation Response ---
+        # Adapt this based on the ACTUAL response structure from your model.
+        generated_image_bytes = None
+        if response.parts:
+            for part in response.parts:
+                 # Check if the part contains image data (adjust mime types if needed)
+                 if part.mime_type and part.mime_type.startswith("image/"):
+                     # Assuming the image data is directly in 'part.blob' which might be specific to vision models
+                     # It could be in 'part.data' or require specific handling. Verify this!
+                     if hasattr(part, 'blob') and isinstance(part.blob, bytes):
+                         generated_image_bytes = part.blob
+                         logger.info(f"Image generated successfully (via blob). Mime type: {part.mime_type}")
+                         break
+                     # Add other potential checks based on API docs
+                     # elif hasattr(part, 'data') and isinstance(part.data, bytes):
+                     #    generated_image_bytes = part.data
+                     #    logger.info(f"Image generated successfully (via data). Mime type: {part.mime_type}")
+                     #    break
 
-    # Create a conversation handler
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            CHATTING: [
-                CommandHandler("help", help_command),
-                CommandHandler("reset", reset),
-                CommandHandler("settings", show_settings),
-                CommandHandler("temperature", set_temperature),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text),
-                MessageHandler(filters.PHOTO, handle_photo),
-                MessageHandler(filters.VOICE, handle_voice),
-            ],
-        },
-        fallbacks=[CommandHandler("start", start)],
-    )
-    
-    application.add_handler(conv_handler)
-    
-    # Add standalone command handlers for users who haven't started the conversation
+        # Clean up the "Generating..." message
+        await context.bot.delete_message(chat_id=processing_message.chat_id, message_id=processing_message.message_id)
+
+        if generated_image_bytes:
+            image_file = io.BytesIO(generated_image_bytes)
+            image_file.name = "generated_image.png" # Adjust extension based on mime_type if possible
+            try:
+                await update.message.reply_photo(photo=InputFile(image_file), caption=f"✨ Here's the image for: '{prompt}'")
+            except TelegramError as te:
+                logger.error(f"Telegram error sending generated photo: {te}")
+                await update.message.reply_text(f"I generated the image, but failed to send it due to a Telegram error: {te}")
+        else:
+            # Check if response.text contains an explanation or error
+            error_text = "Sorry, I couldn't generate an image. No image data received."
+            if hasattr(response, 'text') and response.text:
+                 error_text = f"Sorry, I couldn't generate an image. Response: {response.text}"
+            elif response.prompt_feedback:
+                 error_text = f"Sorry, generation failed due to: {response.prompt_feedback}"
+
+            logger.warning(f"Image generation failed or no image data found. Response: {response}")
+            await update.message.reply_text(error_text)
+
+    except genai.types.BlockedPromptException as bpe:
+        logger.warning(f"Image generation prompt blocked for user {user.id}. Reason: {bpe}")
+        await context.bot.delete_message(chat_id=processing_message.chat_id, message_id=processing_message.message_id)
+        await update.message.reply_text("Sorry, your prompt was blocked by safety filters. Please try a different prompt.")
+    except genai.types.StopCandidateException as sce:
+         logger.warning(f"Image generation stopped for user {user.id}. Reason: {sce}")
+         await context.bot.delete_message(chat_id=processing_message.chat_id, message_id=processing_message.message_id)
+         await update.message.reply_text("Sorry, the image generation was stopped, possibly due to content policies. Please try again or adjust your prompt.")
+    except Exception as e:
+        logger.error(f"Error during image generation for user {user.id}: {e}", exc_info=True)
+        try:
+            await context.bot.delete_message(chat_id=processing_message.chat_id, message_id=processing_message.message_id)
+        except TelegramError:
+            pass # Ignore if deleting the message fails
+        await update.message.reply_text(f"😥 An unexpected error occurred while trying to generate the image. Please try again later.")
+
+
+# --- Message Handler ---
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles text messages and messages with photos."""
+    if not vision_model:
+        await update.message.reply_text("Sorry, the bot is not properly configured to process messages.")
+        return
+
+    message = update.message
+    user_input_text = message.text or message.caption # Use caption if text is empty (for images)
+    user_image = None
+    image_bytes = None
+    user = update.effective_user
+
+    logger.info(f"Received message from user {user.id}. Text/Caption: '{user_input_text}', Photo: {message.photo is not None}")
+
+    # 1. Handle Photo Input
+    if message.photo:
+        # Inform user that image is being processed
+        processing_msg = await update.message.reply_text("⏳ Processing image...", disable_notification=True)
+        photo_file_id = message.photo[-1].file_id # Get the largest resolution photo
+        image_bytes = await download_image(photo_file_id, context)
+
+        if image_bytes:
+            try:
+                # Open image using Pillow to send to Gemini
+                user_image = Image.open(io.BytesIO(image_bytes))
+                logger.info(f"Image downloaded and opened successfully for user {user.id}.")
+            except Exception as e:
+                logger.error(f"Error opening downloaded image bytes: {e}")
+                await processing_msg.edit_text("Sorry, I couldn't process the image file you sent.")
+                return
+        else:
+            await processing_msg.edit_text("Sorry, I failed to download the image.")
+            return
+        # Clean up the "Processing..." message after download attempt
+        try:
+            await context.bot.delete_message(chat_id=processing_msg.chat_id, message_id=processing_msg.message_id)
+        except TelegramError:
+            pass # Ignore if deletion fails
+
+    # 2. Prepare Content for Gemini
+    gemini_input_parts = []
+    if user_input_text:
+        gemini_input_parts.append(user_input_text)
+    if user_image:
+        # Append the PIL Image object directly
+        gemini_input_parts.append(user_image)
+
+    # Check if there's anything to send
+    if not gemini_input_parts:
+        logger.warning(f"No text or valid image to process for user {user.id}.")
+        # Optionally send a message if only an image *failed* to process but no text was sent
+        # await update.message.reply_text("Please send text or ensure the image is valid.")
+        return
+
+    # 3. Call Gemini API
+    processing_message = await update.message.reply_text("🧠 Thinking...", disable_notification=True)
+    try:
+        # Use the vision model for multimodal input
+        response = await vision_model.generate_content_async(
+            gemini_input_parts,
+            # Add safety_settings or generation_config if needed
+        )
+
+        # Clean up the "Thinking..." message
+        await context.bot.delete_message(chat_id=processing_message.chat_id, message_id=processing_message.message_id)
+
+        # 4. Send Gemini's Response
+        if response.text:
+             # Send text response (consider chunking for long messages)
+             max_length = constants.MessageLimit.TEXT_LENGTH
+             for i in range(0, len(response.text), max_length):
+                 chunk = response.text[i:i+max_length]
+                 await update.message.reply_text(chunk, parse_mode=constants.ParseMode.MARKDOWN)
+        else:
+            # Handle cases where response might be blocked or empty
+             logger.warning(f"Gemini response for user {user.id} was empty or blocked. Feedback: {response.prompt_feedback}")
+             fallback_text = "I received your message, but I didn't get a text response back."
+             if response.prompt_feedback:
+                 fallback_text += f"\nReason: {response.prompt_feedback}"
+             await update.message.reply_text(fallback_text)
+
+
+    except genai.types.BlockedPromptException as bpe:
+        logger.warning(f"Gemini request blocked for user {user.id}. Reason: {bpe}")
+        await context.bot.delete_message(chat_id=processing_message.chat_id, message_id=processing_message.message_id)
+        await update.message.reply_text("Sorry, your message was blocked by safety filters.")
+    except genai.types.StopCandidateException as sce:
+        logger.warning(f"Gemini response stopped for user {user.id}. Reason: {sce}")
+        await context.bot.delete_message(chat_id=processing_message.chat_id, message_id=processing_message.message_id)
+        await update.message.reply_text("Sorry, the response generation was stopped, possibly due to content policies.")
+    except Exception as e:
+        logger.error(f"Error calling Gemini API for user {user.id}: {e}", exc_info=True)
+        try:
+            await context.bot.delete_message(chat_id=processing_message.chat_id, message_id=processing_message.message_id)
+        except TelegramError:
+            pass
+        await update.message.reply_text("😥 An unexpected error occurred while processing your request. Please try again later.")
+
+
+# --- Main Execution ---
+def main() -> None:
+    """Starts the Telegram bot."""
+    if not TELEGRAM_BOT_TOKEN:
+        logger.critical("TELEGRAM_BOT_TOKEN environment variable not set! Exiting.")
+        return
+    if not GOOGLE_API_KEY:
+        # Log warning but allow continuation if only vision is maybe needed or key set later
+        logger.warning("GOOGLE_API_KEY environment variable not set! Some features might fail.")
+    if not vision_model and not generation_model:
+        logger.critical("Both Vision and Generation models failed to initialize. Exiting.")
+        return
+    elif not vision_model:
+         logger.warning("Vision model failed to initialize. Text/Image processing will not work.")
+    elif not generation_model:
+         logger.warning("Generation model not initialized. /generate_image command will not work.")
+
+
+    logger.info("Starting bot application...")
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # Register command handlers
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    
-    # Register error handler
-    application.add_error_handler(error_handler)
-    
-    # Run the bot until the user presses Ctrl-C
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    if generation_model: # Only add handler if model is available
+        application.add_handler(CommandHandler("generate_image", generate_image_command))
+    else:
+        logger.info("Skipping /generate_image handler registration as model is unavailable.")
+
+    # Register message handler for text (excluding commands) OR photos (with potential captions)
+    application.add_handler(MessageHandler(
+        (filters.TEXT & ~filters.COMMAND) | filters.PHOTO, handle_message
+    ))
+
+    # Start the Bot using polling
+    logger.info("Bot started successfully. Running polling...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES) # Process all update types
+
 
 if __name__ == "__main__":
     main()
