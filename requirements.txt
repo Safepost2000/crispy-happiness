@@ -1,8 +1,6 @@
-python-telegram-bot
-google-generativeai
-pillow
-python-dotenv
-requests
-SpeechRecognition
-gTTS 
-ffmpeg-python
+python-telegram-bot>=21.0.1 # Use a recent version
+google-generativeai>=0.5.0 # Use a recent version
+python-dotenv>=1.0.0
+requests>=2.28.0
+Pillow>=9.0.0
+httpx>=0.24.0 # Often a dependency, good to specify
